@@ -1,15 +1,9 @@
 /**
- * What this device can actually encode.
+ * Device encoding capabilities and export presets.
  *
- * Every export preset is probed here before it is offered, because a format
- * dropdown that fails on click is worse than a dropdown with three options.
- *
- * Two probes are used and they answer different questions:
- *   - mediabunny's canEncodeVideo/canEncodeAudio: "can this library encode this
- *     codec at these dimensions", including any custom encoder registered.
- *   - the raw VideoEncoder.isConfigSupported: "does this exact codec string
- *     work", which catches the case where a browser claims H.264 support but
- *     has no encoder for that profile.
+ * Probes WebCodecs/mediabunny support and exposes only presets the device can
+ * realistically produce. Hardware acceleration is requested via prefer-hardware
+ * where supported by the browser.
  */
 import { canEncodeAudio, canEncodeVideo } from "mediabunny";
 import { registerAacEncoder } from "@mediabunny/aac-encoder";
@@ -20,96 +14,92 @@ export type AudioCodec = "aac" | "opus";
 
 export interface RawProbe {
   codec: string;
+  label: string;
   supported: boolean;
-  /** True when the browser accepts a prefer-hardware config for this codec. */
   hardwarePath: boolean;
   error?: string;
-}
-
-export interface Capabilities {
-  webCodecs: boolean;
-  /** True when AAC had to be polyfilled, false when the browser could do it. */
-  aacPolyfilled: boolean;
-  /** Resolved codec string the browser will use for H.264, if any. */
-  avcCodecString: string | null;
-  raw: RawProbe[];
-  /** Presets the device can actually produce. Empty means no export at all. */
-  presets: ExportPreset[];
-  /** Human-readable reasons for anything that was turned off. */
-  notes: string[];
 }
 
 export interface ExportPreset {
   id: string;
   label: string;
   container: Container;
+  width: number;
   height: number;
+  fps: 30 | 60;
+  bitrateMbps: number;
   videoCodec: VideoCodec;
   audioCodec: AudioCodec;
   extension: "mp4" | "webm";
   mimeType: string;
+  fastPathEligible: boolean;
 }
 
-/** H.264 level 3.1 (720p30) and 4.0 (1080p30) in the AVCDecoderConfigurationRecord form. */
-const AVC_CANDIDATES = [
-  { codec: "avc1.4d002a", height: 720 }, // main profile, level 3.1
-  { codec: "avc1.4d0034", height: 1080 }, // main profile, level 4.0
-];
+export interface Capabilities {
+  webCodecs: boolean;
+  aacPolyfilled: boolean;
+  avcCodecString: string | null;
+  raw: RawProbe[];
+  presets: ExportPreset[];
+  notes: string[];
+}
 
-const DEFAULT_FPS = 30;
-const DEFAULT_BITRATE = 6_000_000;
+const AVC_PROFILES = [
+  { codec: "avc1.42001f", label: "H.264 Baseline 3.1", width: 1280, height: 720 },
+  { codec: "avc1.4d002a", label: "H.264 Main 3.1", width: 1280, height: 720 },
+  { codec: "avc1.4d0028", label: "H.264 Main 4.0", width: 1920, height: 1080 },
+  { codec: "avc1.640028", label: "H.264 High 4.0", width: 1920, height: 1080 },
+  { codec: "avc1.640033", label: "H.264 High 5.1", width: 3840, height: 2160 },
+];
 
 function hasWebCodecs(): boolean {
   return typeof globalThis.VideoEncoder !== "undefined" && typeof globalThis.VideoDecoder !== "undefined";
 }
 
-async function probeRaw(codec: string, width: number, height: number): Promise<RawProbe> {
+async function probeRaw(
+  codec: string,
+  label: string,
+  width: number,
+  height: number,
+  framerate: number,
+  bitrate: number
+): Promise<RawProbe> {
   if (typeof globalThis.VideoEncoder === "undefined") {
-    return { codec, supported: false, hardwarePath: false, error: "VideoEncoder is not available" };
+    return { codec, label, supported: false, hardwarePath: false, error: "VideoEncoder unavailable" };
   }
-  const base = {
-    codec,
-    width,
-    height,
-    bitrate: DEFAULT_BITRATE,
-    framerate: DEFAULT_FPS,
-  };
+  const base: VideoEncoderConfig = { codec, width, height, bitrate, framerate };
   try {
     const plain = await globalThis.VideoEncoder.isConfigSupported(base);
     let hardwarePath = false;
     if (plain.supported) {
       try {
-        const hardware = await globalThis.VideoEncoder.isConfigSupported({
+        const hw = await globalThis.VideoEncoder.isConfigSupported({
           ...base,
           hardwareAcceleration: "prefer-hardware",
-        });
-        hardwarePath = Boolean(hardware.supported);
+        } as VideoEncoderConfig);
+        hardwarePath = Boolean(hw.supported);
       } catch {
         hardwarePath = false;
       }
     }
-    return { codec, supported: Boolean(plain.supported), hardwarePath };
+    return { codec, label, supported: Boolean(plain.supported), hardwarePath };
   } catch (err) {
-    return {
-      codec,
-      supported: false,
-      hardwarePath: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
+    return { codec, label, supported: false, hardwarePath: false, error: err instanceof Error ? err.message : String(err) };
   }
 }
 
-/**
- * Register the AAC encoder when the browser has none, then work out which export
- * presets exist.
- *
- * registerAacEncoder() is called here, on the main thread, on purpose. Calling it
- * inside a nested blob Web Worker stalls Firefox: the polyfill itself spins up a
- * worker, and Firefox refuses to nest one blob worker inside another.
- */
+function even(n: number): number {
+  return Math.round(n / 2) * 2;
+}
+
+function dimsForHeight(aspectW: number, aspectH: number, targetHeight: number): { width: number; height: number } {
+  const height = even(targetHeight);
+  const width = even((height * aspectW) / aspectH);
+  return { width, height };
+}
+
 export async function detectCapabilities(): Promise<Capabilities> {
   const notes: string[] = [];
-
   if (!hasWebCodecs()) {
     return {
       webCodecs: false,
@@ -117,7 +107,7 @@ export async function detectCapabilities(): Promise<Capabilities> {
       avcCodecString: null,
       raw: [],
       presets: [],
-      notes: ["This browser has no WebCodecs, so nothing can be encoded here. Use a current Chrome, Edge, Safari or Firefox."],
+      notes: ["WebCodecs is unavailable. Export requires a current Chromium, Safari, or Firefox build with encoder support."],
     };
   }
 
@@ -126,92 +116,121 @@ export async function detectCapabilities(): Promise<Capabilities> {
     if (!(await canEncodeAudio("aac"))) {
       registerAacEncoder();
       aacPolyfilled = true;
-      notes.push("No native AAC encoder, so the bundled AAC encoder is now in use. MP4 export still works.");
+      notes.push("Native AAC encoder unavailable; bundled AAC encoder registered for MP4 export.");
     }
   } catch (err) {
-    notes.push(`Could not check AAC support: ${err instanceof Error ? err.message : String(err)}`);
+    notes.push(`AAC capability check failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  // Probe H.264 at both sizes, and VP9 as the fallback for devices with no encoder.
   const raw: RawProbe[] = [];
-  for (const candidate of AVC_CANDIDATES) {
-    const width = Math.round((candidate.height * 16) / 9 / 2) * 2;
-    raw.push(await probeRaw(candidate.codec, width, candidate.height));
+  // Probe representative AVC profiles and VP9 at common targets.
+  for (const p of AVC_PROFILES) {
+    raw.push(await probeRaw(p.codec, `${p.label} ${p.height}p`, p.width, p.height, 30, 8_000_000));
   }
-  raw.push(await probeRaw("vp09.00.10.08", 1280, 720));
+  raw.push(await probeRaw("vp09.00.10.08", "VP9 Profile 0 720p", 1280, 720, 30, 5_000_000));
+  raw.push(await probeRaw("vp09.00.31.08", "VP9 Profile 0 1080p", 1920, 1080, 30, 8_000_000));
+  raw.push(await probeRaw("vp09.00.51.08", "VP9 Profile 0 4K", 3840, 2160, 30, 20_000_000));
 
-  const avc720 = raw.find((p) => p.codec === "avc1.4d002a")?.supported ?? false;
-  const avc1080 = raw.find((p) => p.codec === "avc1.4d0034")?.supported ?? false;
-  const vp9 = raw.find((p) => p.codec === "vp09.00.10.08")?.supported ?? false;
+  const supportedAvc = raw.filter((r) => r.codec.startsWith("avc1") && r.supported);
+  const avc720ok = supportedAvc.some((r) => /3\.1|720/.test(r.label));
+  const avc1080ok = supportedAvc.some((r) => /4\.0|1080/.test(r.label));
+  const avc4kok = supportedAvc.some((r) => /5\.1|4K|2160/.test(r.label));
+  const vp9_720 = raw.find((r) => r.codec === "vp09.00.10.08")?.supported ?? false;
+  const vp9_1080 = raw.find((r) => r.codec === "vp09.00.31.08")?.supported ?? false;
+  const vp9_4k = raw.find((r) => r.codec === "vp09.00.51.08")?.supported ?? false;
+  const avcCodecString = supportedAvc.sort((a, b) => b.codec.localeCompare(a.codec))[0]?.codec ?? null;
 
   const presets: ExportPreset[] = [];
 
-  const avcOk720 = avc720 && (await canEncodeVideo("avc", { width: 1280, height: 720 }));
-  const avcOk1080 = avc1080 && (await canEncodeVideo("avc", { width: 1920, height: 1080 }));
-
-  if (avcOk720) {
-    presets.push({
-      id: "mp4-720",
-      label: "MP4 · H.264 · 720p",
-      container: "mp4",
-      height: 720,
-      videoCodec: "avc",
-      audioCodec: "aac",
-      extension: "mp4",
-      mimeType: "video/mp4",
-    });
-  }
-  if (avcOk1080) {
-    presets.push({
-      id: "mp4-1080",
-      label: "MP4 · H.264 · 1080p",
-      container: "mp4",
-      height: 1080,
-      videoCodec: "avc",
-      audioCodec: "aac",
-      extension: "mp4",
-      mimeType: "video/mp4",
-    });
+  async function tryAdd(p: Omit<ExportPreset, "id"> & { id?: string }) {
+    const videoOk = await canEncodeVideo(p.videoCodec, { width: p.width, height: p.height }).catch(() => false);
+    const audioOk = await canEncodeAudio(p.audioCodec).catch(() => false);
+    if (!videoOk || !audioOk) return;
+    presets.push({ id: p.id ?? `${p.container}-${p.height}p${p.fps}`, ...p } as ExportPreset);
   }
 
-  if (vp9 && (await canEncodeVideo("vp9", { width: 1280, height: 720 }))) {
-    presets.push({
-      id: "webm-720",
-      label: "WebM · VP9 · 720p",
-      container: "webm",
-      height: 720,
-      videoCodec: "vp9",
-      audioCodec: "opus",
-      extension: "webm",
-      mimeType: "video/webm",
-    });
-    if (await canEncodeVideo("vp9", { width: 1920, height: 1080 })) {
-      presets.push({
-        id: "webm-1080",
-        label: "WebM · VP9 · 1080p",
-        container: "webm",
-        height: 1080,
-        videoCodec: "vp9",
-        audioCodec: "opus",
-        extension: "webm",
-        mimeType: "video/webm",
-      });
+  const aspect16x9 = { w: 16, h: 9 };
+  const targets: { labelBase: string; height: number; fps: 30 | 60; bitrateMbps: number }[] = [
+    { labelBase: "720p", height: 720, fps: 30, bitrateMbps: 5 },
+    { labelBase: "720p", height: 720, fps: 60, bitrateMbps: 7.5 },
+    { labelBase: "1080p", height: 1080, fps: 30, bitrateMbps: 8 },
+    { labelBase: "1080p", height: 1080, fps: 60, bitrateMbps: 12 },
+    { labelBase: "4K", height: 2160, fps: 30, bitrateMbps: 35 },
+    { labelBase: "4K", height: 2160, fps: 60, bitrateMbps: 53 },
+  ];
+
+  for (const t of targets) {
+    const { width, height } = dimsForHeight(aspect16x9.w, aspect16x9.h, t.height);
+    const is4k = t.height >= 2160;
+    if (avc720ok || avc1080ok || avc4kok) {
+      if ((t.height <= 720 && avc720ok) || (t.height === 1080 && avc1080ok) || (is4k && avc4kok)) {
+        await tryAdd({
+          label: `MP4 · H.264 · ${t.labelBase} ${t.fps}fps · ${t.bitrateMbps} Mbps`,
+          container: "mp4",
+          width,
+          height,
+          fps: t.fps,
+          bitrateMbps: t.bitrateMbps,
+          videoCodec: "avc",
+          audioCodec: "aac",
+          extension: "mp4",
+          mimeType: "video/mp4",
+          fastPathEligible: true,
+        });
+      }
+    }
+    if (vp9_720 || vp9_1080 || vp9_4k) {
+      if ((t.height <= 720 && vp9_720) || (t.height === 1080 && vp9_1080) || (is4k && vp9_4k)) {
+        await tryAdd({
+          label: `WebM · VP9 · ${t.labelBase} ${t.fps}fps · ${t.bitrateMbps} Mbps`,
+          container: "webm",
+          width,
+          height,
+          fps: t.fps,
+          bitrateMbps: t.bitrateMbps,
+          videoCodec: "vp9",
+          audioCodec: "opus",
+          extension: "webm",
+          mimeType: "video/webm",
+          fastPathEligible: true,
+        });
+      }
     }
   }
 
-  if (!avcOk720) {
-    notes.push("This device has no H.264 encoder, so MP4 export is hidden rather than broken. WebM is offered instead.");
+  if (!supportedAvc.length) {
+    notes.push("No H.264 encoder detected; MP4 presets are hidden and WebM/VP9 is preferred when available.");
   }
   if (aacPolyfilled) {
-    notes.push("AAC came from the bundled encoder, so MP4 audio is a software encode: slower than native, same result.");
+    notes.push("AAC uses the bundled software encoder; expect slower MP4 exports than native hardware AAC paths.");
+  }
+  if (!presets.some((p) => p.height >= 2160)) {
+    notes.push("4K export presets are unavailable on this device/browser. 1080p is the recommended maximum.");
   }
 
   return {
     webCodecs: true,
     aacPolyfilled,
-    avcCodecString: avc1080 ? "avc1.4d0034" : avc720 ? "avc1.4d002a" : null,
+    avcCodecString,
     raw,
     presets,
     notes,
   };
+}
+
+export async function probeHardwarePreference(codec: string, width: number, height: number, bitrate: number, framerate: number): Promise<boolean> {
+  if (typeof globalThis.VideoEncoder === "undefined") return false;
+  try {
+    const hw = await globalThis.VideoEncoder.isConfigSupported({
+      codec,
+      width,
+      height,
+      bitrate,
+      framerate,
+      hardwareAcceleration: "prefer-hardware",
+    } as VideoEncoderConfig);
+    return Boolean(hw.supported);
+  } catch {
+    return false;
+  }
 }
