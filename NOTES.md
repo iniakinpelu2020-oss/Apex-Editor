@@ -1,192 +1,193 @@
 # Apex Editor — technical notes and corrections
 
-Read this before writing code. Everything below is either a verified fact or a decision that
-has to be made deliberately, and three of these would cost you days if you found them by
-trial.
+Read this before changing the pipeline. Everything below is either a verified fact or a
+decision that has to be made deliberately, and several of these would cost days if you found
+them by trial.
 
 ## 1. MP4 with AAC audio needs one extra package, and a capability check
 
-The spec says "render crisp `.mp4` (H.264 + AAC) 100% client-side". That is achievable, but
-not with `mediabunny` alone.
+"Render crisp `.mp4` (H.264 + AAC) 100% client-side" is achievable, but not with `mediabunny`
+alone.
 
-Verified current state of WebCodecs audio encoding:
+Verified state of WebCodecs audio encoding:
 
 - **Opus** — broadly supported for encoding, and the safe choice everywhere.
 - **AAC** — *not* supported for encoding in Firefox on any platform, nor in any browser on
-  desktop Linux. Safari supports it only from version 26. Chrome supports it on most
-  platforms.
+  desktop Linux. Safari supports it only from version 26. Chrome supports it on most platforms.
 
-So an MP4 + AAC export will simply fail for a chunk of your users, including anyone on
-Firefox. The fix is a package that ships with the muxer's ecosystem:
-
-```
-npm install mediabunny @mediabunny/aac-encoder
-```
+So an MP4 + AAC export will simply fail for a chunk of browsers. The fix:
 
 ```ts
 import { canEncodeAudio } from "mediabunny";
 import { registerAacEncoder } from "@mediabunny/aac-encoder";
 
-// use the browser's encoder when it exists, and a WASM AAC-LC encoder when it does not
 if (!(await canEncodeAudio("aac"))) registerAacEncoder();
 ```
 
-That polyfill is a size-optimised WASM build of FFmpeg's AAC encoder. With it registered,
-MP4 + AAC works everywhere the muxer does.
+That polyfill is a size-optimised WASM build of FFmpeg's AAC encoder. With it registered, MP4 +
+AAC works anywhere the muxer does.
 
-**H.264 video encoding has the same problem.** Chrome on Android uses hardware encoders and
-is fine; desktop Linux Chrome frequently has no H.264 encoder at all. Use
-`VideoEncoder.isConfigSupported()` with the real codec string (`avc1.4d0034`, not `"h264"`)
-before offering the option.
+**Call it on the main thread.** `registerAacEncoder()` spins up a Worker internally, and Firefox
+refuses to nest a blob-buffer worker inside another worker — so registering from inside a nested
+worker stalls the export with no error. `src/lib/capabilities.ts` calls it from the main thread
+during the startup probe.
 
-**The design that follows from this:** probe capabilities at startup, then show only the
-profiles the device can actually produce.
+**H.264 has the same problem.** Chrome on Android uses hardware encoders and is fine; desktop
+Linux Chrome frequently has no H.264 encoder at all. Probe with the real codec string
+(`avc1.4d002a` for 720p30, `avc1.4d0034` for 1080p30 — never `"h264"`) before offering it.
 
 | Profile | Video | Audio | Container | When |
 | --- | --- | --- | --- | --- |
 | Best | H.264 | AAC | MP4 | encoder supports both |
-| Fallback | VP9 or AV1 | Opus | WebM | no H.264 or no AAC |
+| Fallback | VP9 | Opus | WebM | no H.264 encoder |
 | Never ship | — | — | — | a format dropdown that fails on click |
 
-## 2. 4K is a trap on a phone
+## 2. A preset is a promise about the codec, not just the container
 
-4K export on Android is frequently unsupported for H.264 encode, and where it is supported
-it heats the device and throttles within seconds. Default to 1080p. Offer 4K only when
-`isConfigSupported` returns true *and* the source is at least 4K — upscaling a 1080p clip to
-4K produces a bigger file of the same picture.
+This one bit the first working build, and it is the most dangerous bug in the export path
+because it produces a *successful* export that is not what it says.
 
-Also measure before trusting: a 60-second 1080p30 timeline holds roughly 1.8 GB of raw frames
-if you buffer it. Stream frames to the encoder as you draw them; never build an array of
-`VideoFrame`s first.
+`Conversion` copies encoded packets whenever it can. Given a VP9 source and an MP4 output with
+`audio: { codec: "aac" }` and no `video` option, mediabunny will copy the **VP9 track into an
+MP4** — because MP4 is allowed to contain VP9. The export finishes in milliseconds, the file
+plays, and the app says "MP4 · H.264". It is not H.264.
 
-## 3. Supabase pauses a quiet project, and this is exactly a quiet project
+The fix is in `exportClip`: read the source track's codec with `getCodec()`, compare it to the
+preset, and when they differ, name the codec explicitly so the conversion re-encodes:
 
-The free tier pauses a project after about a week without activity. An editor you open once a
-month will be dead every time you open it, with an error that looks like a code bug.
+```ts
+const codecMismatch = sourceVideoCodec !== req.videoCodec;
+video: wantsResize
+  ? { codec: req.videoCodec, width, height, fit: "contain" }
+  : codecMismatch ? { codec: req.videoCodec } : undefined,
+```
 
-Two honest options:
+Verified after the fix: exporting a 3 s VP9 clip as "MP4 · H.264 · 720p" produces bytes
+containing `avc1` and `avcC` and **no** `vp09`, in 0.4 s. Before the fix the same export took
+0.0 s and contained `vp09`.
 
-1. **Keep Supabase and add a keepalive.** One scheduled Worker (you already have the cron
-   pattern in `Automation`) that runs a trivial `select 1` daily. Cheap, and it keeps the
-   project awake.
-2. **Drop Supabase and use Firestore.** You are already using Firebase Auth, and Firestore's
-   free tier has no pause. The timeline JSON is a document — this is what Firestore is for.
-   Fewer vendors, one fewer key, one fewer failure mode.
+The same rule applies to audio: only pass `audio: { codec }` when the source audio codec
+differs, otherwise you turn a free copy into a resample for nothing.
 
-Recommendation: option 2 unless you have a reason to prefer SQL. The migration below is
-correct and ready either way.
+## 3. `trim.start` and the copy path
 
-## 4. `VITE_OWNER_UID` is not a security control
+Copy is what makes a ten-second cut take a second instead of a minute. Two things limit it:
 
-Anything named `VITE_` is compiled into the bundle and readable in the browser's dev tools.
-Checking the signed-in UID against `VITE_OWNER_UID` stops nobody; it is a convenience check
-so *you* do not open the editor in the wrong account.
+- The output container must accept the source codec and the timestamps.
+- Resizing, rotating or changing a codec forces a transcode by definition.
 
-The actual boundaries are:
+Mediabunny's docs note that setting `trim.start` to a non-default value currently forces a
+transcode of both video and audio in the default configuration; the packet-copy path for
+arbitrary trim ranges arrives via MP4 edit lists and the `copy` options. This repo passes
+`copy: { mode: "preferred" }` and lets the library decide, then reports what actually happened
+in the UI rather than promising a fast path it cannot guarantee.
 
-- **Database:** row level security, `auth.uid() = user_id`, on every policy. That is what the
-  migration is for.
-- **Storage:** the Worker checks the caller's Firebase ID token and refuses anyone who is not
-  the owner before it presigns anything.
-- **AI router:** same check, per request. An AI route with no auth is a route that spends your
-  free allowance for strangers.
+Measured on a 3 s 640×360 VP9 clip in the test browser:
 
-Treat the owner UID as UI, the RLS policies and Worker checks as security.
+| Export | Result | Time |
+| --- | --- | --- |
+| WebM · VP9 (codec matches) | 313 KB, copied | 0.0 s |
+| MP4 · H.264 (codec differs) | 233 KB, re-encoded | 0.4 s |
+| MP4 · H.264, 0 → 1.5 s | 117 KB, exactly 1.50 s | 0.2 s |
 
-## 5. Backblaze never touches the browser
+## 4. 4K is a trap on a phone
 
-The B2 application key opens a whole bucket. It must live in the Worker as a secret, and the
-browser gets short-lived presigned URLs — five minutes, one object, one method. This is
-already built in `Apex-Drive`; reuse that signing code rather than writing a second version.
+4K export on Android is frequently unsupported for H.264 encode, and where it is supported it
+heats the device and throttles within seconds. Default to 1080p. Offer 4K only when
+`isConfigSupported` returns true *and* the source is at least 4K — upscaling a 1080p clip to 4K
+produces a bigger file of the same picture.
 
-## 6. Silence and beat detection are DSP, not AI
+Also: a 60-second 1080p30 timeline holds roughly 1.8 GB of raw frames if you buffer it. Stream
+frames to the encoder as you draw them; never build an array of `VideoFrame`s first.
 
-The spec routes "cut all silent pauses" and beat detection toward the AI router. Do not.
-Both are exact measurements:
+## 5. Supabase is gone; timelines live in Firestore
 
-- **Silence:** scan PCM for windows below a threshold (say -42 dBFS) lasting longer than
-  300 ms. Web Audio gives you the samples; the loop is twenty lines and runs on any phone in
-  under a second for a ten-minute track.
-- **Beats:** find transient peaks in a low-passed signal, or run an onset detector over the
-  amplitude envelope.
+Supabase's free tier pauses a project after about a week without activity. An editor you open
+once a month is exactly that shape of project, and the failure looks like a code bug.
 
-An LLM cannot hear the audio. Sending it a waveform and asking where the pauses are is slower,
-costs tokens, and is wrong sometimes — which for an automatic cutter means deleting audio you
-wanted.
+Firestore does not pause, and Firebase Auth was already the sign-in gate. So this app uses
+**Firebase Auth + Cloud Firestore only**: `projects/{projectId}` per project, timeline JSON
+only, well under the 100 KB document guidance. Raw media never goes into Firestore — it stays
+in OPFS/IndexedDB or in B2 behind presigned URLs.
 
-The right split: the DSP produces the facts (list of gap ranges, list of beat timestamps),
-then the model — or better, plain code — turns those facts into edits. One-click dead-air
-removal then needs no AI at all.
+`supabase/migrations/0001_apex_editor_projects.sql` has been removed from this repo so there is
+one obvious source of truth for persistence.
 
-## 7. AI timeline patches need a schema, a diff and a confirm
+## 6. Ownership is enforced by rules, not by the frontend
 
-Section 3.2 has the copilot return JSON patches applied "cleanly to the Undo/Redo stack".
-Applied cleanly is doing a lot of work in that sentence.
+`VITE_OWNER_UID` is gone. It was a convenience check that looked like security: anything named
+`VITE_` is compiled into the bundle and readable in dev tools.
 
-Rules that keep this safe:
+The boundaries that actually hold:
+
+- **Firestore:** `firestore.rules` requires a signed-in user, requires
+  `request.resource.data.userId == request.auth.uid` on create, and refuses any update that
+  changes `userId`. The wildcard rule at the end denies everything else, so a new collection is
+  closed by default.
+- **Storage:** the AI Router Worker checks the caller's Firebase ID token and refuses anyone who
+  is not the owner before presigning. It also forces every key under `u/<uid>/`.
+- **AI:** the same token check per request. An AI route with no auth spends your free allowance
+  for strangers.
+
+`userId` is written from the caller's own `uid` in `src/lib/firestore.ts`, but that is a
+courtesy: the rules reject a forged value server-side.
+
+## 7. Backblaze never touches the browser
+
+The B2 application key opens a whole bucket. It lives in the Worker as a secret; the browser
+gets short-lived presigned URLs — minutes, one object, one method.
+
+## 8. Silence and beat detection are DSP, not AI
+
+Both are exact measurements, not model outputs:
+
+- **Silence:** scan PCM for windows below a threshold (say -42 dBFS) lasting longer than 300 ms.
+  Web Audio gives you the samples; twenty lines, under a second for a ten-minute track.
+- **Beats:** transient peaks in a low-passed signal, or an onset detector over the amplitude
+  envelope.
+
+An LLM cannot hear the audio. The right split: DSP produces the facts (gap ranges, beat
+timestamps), then plain code turns them into edits.
+
+## 9. AI timeline patches need a schema, a diff and a confirm
 
 1. The model returns a **named action list** from a closed set (`splitClip`, `deleteRange`,
    `addKeyframe`, `setSpeed`, `addText`). Anything outside the set is rejected, not guessed.
 2. Every patch is validated against a schema **before** it touches state.
-3. Show the effect as a sentence — "split 7 clips, delete 42s, add 3 keyframes" — and require
-   a click. Never auto-apply.
-4. Apply the whole batch as **one** undo entry, so one Ctrl+Z reverses the command rather than
-   leaving the timeline half-edited.
+3. Show the effect as a sentence — "split 7 clips, delete 42s, add 3 keyframes" — and require a
+   click. Never auto-apply.
+4. Apply the whole batch as **one** undo entry.
 5. Log every applied patch with the prompt that caused it.
-
-This matches the copilot rules in `Apex/COPILOT.md`: the model proposes, the app disposes.
-
-## 8. Captions: resample, cap, and say what happened
-
-- Resample to 16 kHz mono before sending. Whisper does not need more, and it makes the upload
-  roughly a twentieth of the size.
-- Chunk long audio. A 40-minute podcast is one failed request; ten four-minute chunks are ten
-  successes you can stitch, and one failure barely matters.
-- Timestamps come back per segment; word-level timing is what makes kinetic captions work, so
-  check the model you pick actually returns words, not just sentences.
-- Keep the transcript. Re-running transcription because a caption style changed is waste.
-
-## 9. Scope: this is a months-long build, so pick a version that ships
-
-The specification describes CapCut. CapCut is built by a large team. A realistic first version
-for one person, done properly:
-
-**v1 — the one that finishes a video**
-
-- One video track, one overlay track, one text/caption track, one audio track.
-- Trim, split, delete, move, and speed on clips.
-- Fade and cross-dissolve only.
-- Canvas preview at 16:9 / 9:16 / 1:1, with scale and position.
-- 1080p MP4 export with a progress bar and a real cancel button.
-- Undo and redo.
-- Save and load the timeline JSON.
-
-**v2 — the one that feels like an editor**
-
-- Keyframes, colour adjustment, more transitions, waveform display in the timeline.
-- Magnetic snapping and ripple delete.
-- Silence removal from the DSP pass.
-- Captions from Whisper.
-
-**v3 — the AI one**
-
-- Timeline copilot with patch previews.
-- Beat markers and auto-cut to the music.
-
-Keyframes, ripple-magnetic editing and AI patching are each a project. Trying to land all
-three at once is how the timeline ends up with a beautiful UI and a broken export button.
 
 ## 10. Build order
 
-1. **Export path.** Load a file, keep ten seconds, encode MP4, download it. Test on your
-   Android phone before anything else. Everything depends on this.
-2. **Timeline state.** Normalised clips, an undo stack, and a playhead clock. No UI polish.
-3. **Compositor.** Draw the current frame for a given time; this is the only thing the
-   preview and the exporter share, so it must be a pure function of `t`.
+1. **Export path.** Load a file, keep ten seconds, encode MP4, download it. Test on the Android
+   phone before anything else. Done — see `README.md`.
+2. **Timeline state.** Normalised clips, an undo stack, a playhead clock. No UI polish.
+3. **Compositor.** Draw the current frame for a given time; the only thing preview and exporter
+   share, so it must be a pure function of `t`.
 4. **Timeline UI.** Ruler, clips, drag, trim, split. This is where the weeks go.
 5. **Persistence.** Save and load, then the B2 media bin.
 6. **Captions, then copilot.**
 
-A note worth keeping: preview and export must render through the same code. If the preview
-uses DOM video elements and the export uses a canvas, they will disagree, and you will spend a
-weekend discovering that your captions are four frames out.
+Preview and export must render through the same code. If the preview uses DOM video elements
+and the export uses a canvas, they will disagree, and you will spend a weekend discovering that
+your captions are four frames out.
+
+## 11. Known gaps in milestone 1
+
+Honest list, so nothing looks finished that is not:
+
+- **Bundle size.** A single 2.5 MB chunk (683 KB gzipped), because Firebase is imported
+  statically. On a phone on a slow connection that is a few seconds of white screen. The fix is
+  to keep the auth/Firestore imports behind `await import()` and only load them when the user
+  signs in or saves. Not done yet.
+- **No Tailwind.** The spec table says Tailwind; this build uses one plain CSS file. Fewer build
+  moving parts for milestone 1. Worth revisiting when the timeline UI lands.
+- **Firebase is untested against a real project.** There is no Firebase config in this
+  environment, so the app runs in local mode and the save button is disabled. The sign-in flow,
+  `firestore.rules` deployment and a real `setDoc` have not been exercised.
+- **No automated tests.** Verification was done by driving the real export path in a browser and
+  inspecting the produced bytes; that should become a test before the timeline lands.
+- **One clip, one track.** The trim is `primary` track only, container-level trimming, no
+  compositor. That is the milestone, not the editor.
